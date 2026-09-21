@@ -64,3 +64,15 @@ This tool is intended for personal use only. Please respect copyright laws and t
 ## License
 
 [MIT](LICENSE)
+
+## Fork changes (churivibhav/reclip)
+
+Customisations for running alongside Jellyfin. Upstream base: `averygan/reclip@1d161d1`.
+
+- **Save to server** button (per card) and **Save All to Server**: downloads go straight into `LIBRARY_DIR` (default `./library`; `/app/library` in Docker) named by video title, with `(2)`, `(3)` on collisions. The existing **Download** button still sends the file to the browser, from the scratch `downloads/` dir.
+- Files are named by title instead of job ID; filenames are sanitised for Windows/NTFS.
+- `deno` + `yt-dlp[default]` in the image for full YouTube support.
+- `DOWNLOAD_TIMEOUT` env var (seconds, default 1800) replaces the hard-coded 5 min limit.
+- `.gitattributes` forces LF endings (shell scripts break with CRLF).
+
+Sync upstream: `git fetch upstream && git merge upstream/main`.

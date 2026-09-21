@@ -342,6 +342,8 @@
     }
     .dl-all-btn:hover { background: #2d2d2a; }
     .dl-all-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .card-dl-btn.server, .dl-all-btn.server { background: var(--accent); color: #fff; }
+    .card-dl-btn.server:hover, .dl-all-btn.server:hover { filter: brightness(0.9); background: var(--accent); }
 
     .spin {
       display: inline-block;
@@ -582,14 +584,17 @@
 
       let actionHtml = '';
       if (c.status === 'ready') {
-        actionHtml = `<button class="card-dl-btn" onclick="dlCard(${idx})">Download</button>${qualityChips}`;
+        actionHtml = `<button class="card-dl-btn" onclick="dlCard(${idx}, 'browser')">Download</button>
+          <button class="card-dl-btn server" onclick="dlCard(${idx}, 'server')">Save to server</button>${qualityChips}`;
       } else if (c.status === 'downloading') {
         actionHtml = `<span class="card-status downloading"><span class="spin"></span> Downloading...</span>`;
+      } else if (c.status === 'done' && c.dest === 'server') {
+        actionHtml = `<span class="card-status done">Saved to server: ${esc(c.filename || '')}</span>`;
       } else if (c.status === 'done') {
         actionHtml = `<button class="card-dl-btn done" onclick="saveCard(${idx})">Save</button>
           <span class="card-status done">${esc(c.filename || '')}</span>`;
       } else if (c.status === 'error') {
-        actionHtml = `<button class="card-dl-btn" onclick="dlCard(${idx})">Retry</button>
+        actionHtml = `<button class="card-dl-btn" onclick="dlCard(${idx}, '${c.dest || 'browser'}')">Retry</button>
           <span class="card-status error">${esc(friendlyError(c.error || 'Download failed'))}</span>`;
       }
 
@@ -610,7 +615,8 @@
       const bar = document.createElement('div');
       bar.id = 'dl-all-bar';
       bar.className = 'dl-all-bar';
-      bar.innerHTML = `<button class="dl-all-btn" onclick="dlAll()">Download All</button>`;
+      bar.innerHTML = `<button class="dl-all-btn" onclick="dlAll('browser')">Download All</button>
+        <button class="dl-all-btn server" onclick="dlAll('server')">Save All to Server</button>`;
       document.getElementById('cards').appendChild(bar);
     }
 
@@ -619,8 +625,9 @@
       renderCard(idx);
     }
 
-    async function dlCard(idx) {
+    async function dlCard(idx, dest = 'browser') {
       const c = cardData[idx];
+      c.dest = dest;
       c.status = 'downloading';
       c.error = null;
       renderCard(idx);
@@ -634,6 +641,7 @@
             format: currentFormat,
             format_id: c.selectedFormatId,
             title: c.title || '',
+            dest,
           }),
         });
         const data = await res.json();
@@ -663,7 +671,7 @@
             c.status = 'done';
             c.filename = data.filename;
             renderCard(idx);
-            saveCard(idx);
+            if (c.dest !== 'server') saveCard(idx);
           } else if (data.status === 'error') {
             clearInterval(iv);
             c.status = 'error';
@@ -688,17 +696,17 @@
       a.click();
     }
 
-    async function dlAll() {
-      const btn = document.querySelector('.dl-all-btn');
-      if (btn) { btn.disabled = true; btn.textContent = 'Downloading...'; }
+    async function dlAll(dest = 'browser') {
+      const btns = document.querySelectorAll('.dl-all-btn');
+      btns.forEach(b => { b.disabled = true; });
 
       for (let i = 0; i < cardData.length; i++) {
         if (cardData[i].status === 'ready') {
-          await dlCard(i);
+          await dlCard(i, dest);
         }
       }
 
-      if (btn) { btn.disabled = false; btn.textContent = 'Download All'; }
+      btns.forEach(b => { b.disabled = false; });
     }
   </script>
 </body>

@@ -7,6 +7,9 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
+# JS runtime yt-dlp needs for full YouTube support (used with yt-dlp-ejs from yt-dlp[default]).
+COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
+
 WORKDIR /app
 
 COPY requirements.txt .
@@ -15,7 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt gunicorn
 COPY . .
 
 RUN useradd -m -u 1000 reclip && \
-    mkdir -p /app/downloads && \
+    mkdir -p /app/downloads /app/library && \
     chown -R reclip:reclip /app
 USER reclip
 

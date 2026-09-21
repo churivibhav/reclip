@@ -2,15 +2,39 @@ import os
 import uuid
 import glob
 import json
+import re
+import shutil
 import subprocess
 import threading
 from flask import Flask, request, jsonify, send_file, render_template
 
 app = Flask(__name__)
+# Scratch dir: yt-dlp works here, and "download to my device" jobs are served from here.
 DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "downloads")
+# Library dir: target of "save to server" jobs (bind-mounted to the Jellyfin videos folder).
+LIBRARY_DIR = os.environ.get("LIBRARY_DIR", os.path.join(os.path.dirname(__file__), "library"))
+DOWNLOAD_TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT", 1800))
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+os.makedirs(LIBRARY_DIR, exist_ok=True)
 
 jobs = {}
+
+
+def safe_filename(title, fallback):
+    """Make a title safe as a filename on Windows/Linux (bind mount lives on NTFS)."""
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "", title or "")
+    name = re.sub(r"\s+", " ", name).strip()[:100].strip(" .")
+    return name or fallback
+
+
+def unique_path(directory, name, ext):
+    """Return directory/name+ext, appending ' (2)', ' (3)'... if it already exists."""
+    path = os.path.join(directory, f"{name}{ext}")
+    n = 2
+    while os.path.exists(path):
+        path = os.path.join(directory, f"{name} ({n}){ext}")
+        n += 1
+    return path
 
 
 def parse_ytdlp_json(stdout):
@@ -45,7 +69,7 @@ def run_download(job_id, url, format_choice, format_id):
     cmd.append(url)
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=DOWNLOAD_TIMEOUT)
         if result.returncode != 0:
             job["status"] = "error"
             job["error"] = result.stderr.strip().split("\n")[-1]
@@ -71,19 +95,27 @@ def run_download(job_id, url, format_choice, format_id):
                 except OSError:
                     pass
 
-        job["status"] = "done"
-        job["file"] = chosen
         ext = os.path.splitext(chosen)[1]
-        title = job.get("title", "").strip()
-        # Sanitize title for filename
-        if title:
-            safe_title = "".join(c for c in title if c not in r'\/:*?"<>|').strip()[:100].strip()
-            job["filename"] = f"{safe_title}{ext}" if safe_title else os.path.basename(chosen)
+        safe_title = safe_filename(job.get("title", ""), job_id)
+
+        if job.get("dest") == "server":
+            # Move into the library under its real title so Jellyfin shows a proper name.
+            final = unique_path(LIBRARY_DIR, safe_title, ext)
+            shutil.move(chosen, final)
+            job["file"] = final
+            job["filename"] = os.path.basename(final)
         else:
-            job["filename"] = os.path.basename(chosen)
+            job["file"] = chosen
+            job["filename"] = f"{safe_title}{ext}"
+        job["status"] = "done"
     except subprocess.TimeoutExpired:
         job["status"] = "error"
-        job["error"] = "Download timed out (5 min limit)"
+        job["error"] = f"Download timed out ({DOWNLOAD_TIMEOUT // 60} min limit)"
+        for f in glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*")):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
     except Exception as e:
         job["status"] = "error"
         job["error"] = str(e)
@@ -170,12 +202,13 @@ def start_download():
     format_choice = data.get("format", "video")
     format_id = data.get("format_id")
     title = data.get("title", "")
+    dest = "server" if data.get("dest") == "server" else "browser"
 
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
     job_id = uuid.uuid4().hex[:10]
-    jobs[job_id] = {"status": "downloading", "url": url, "title": title}
+    jobs[job_id] = {"status": "downloading", "url": url, "title": title, "dest": dest}
 
     thread = threading.Thread(target=run_download, args=(job_id, url, format_choice, format_id))
     thread.daemon = True
@@ -199,7 +232,7 @@ def check_status(job_id):
 @app.route("/api/file/<job_id>")
 def download_file(job_id):
     job = jobs.get(job_id)
-    if not job or job["status"] != "done":
+    if not job or job["status"] != "done" or job.get("dest") == "server":
         return jsonify({"error": "File not ready"}), 404
     return send_file(job["file"], as_attachment=True, download_name=job["filename"])
 
