@@ -140,6 +140,75 @@ def transcribe_with_whisper(video_path, tmp_dir, job_id):
     return "\n".join(srt_lines), " ".join(txt_lines)
 
 
+def download_audio_only(url, tmp_dir, job_id):
+    """Grab just the audio track (for Whisper) — much smaller/faster than a full video."""
+    out_template = os.path.join(tmp_dir, f"{job_id}-audio.%(ext)s")
+    cmd = (
+        ["yt-dlp", "--no-playlist", "-x", "--audio-format", "mp3", "-o", out_template]
+        + ytdlp_extra_args() + [url]
+    )
+    subprocess.run(cmd, capture_output=True, text=True, timeout=DOWNLOAD_TIMEOUT, check=True)
+    files = glob.glob(os.path.join(tmp_dir, f"{job_id}-audio.*"))
+    if not files:
+        raise RuntimeError("Audio download completed but no file was found")
+    return files[0]
+
+
+def run_transcript_only(job_id, url):
+    """Captions/transcript with no video (or audio) ever saved to disk.
+
+    Tries existing captions first (no download at all); only falls back to
+    downloading just the audio track (never the video) for Whisper, and that
+    audio is discarded once transcribed.
+    """
+    job = jobs[job_id]
+    dest = job.get("dest", "browser")
+    safe_title = safe_filename(job.get("title", ""), job_id)
+    target_dir = LIBRARY_DIR if dest == "server" else DOWNLOAD_DIR
+    scratch = os.path.join(DOWNLOAD_DIR, f"{job_id}-scratch")
+    os.makedirs(scratch, exist_ok=True)
+    try:
+        srt_path = fetch_captions(url, scratch, job_id)
+        if srt_path:
+            srt_text = open(srt_path, encoding="utf-8", errors="ignore").read()
+            txt_text = " ".join(
+                line.strip() for line in srt_text.splitlines()
+                if line.strip() and "-->" not in line and not line.strip().isdigit()
+            )
+            job["transcript_source"] = "captions"
+        else:
+            audio_path = download_audio_only(url, scratch, job_id)
+            srt_text, txt_text = transcribe_with_whisper(audio_path, scratch, job_id)
+            job["transcript_source"] = "whisper"
+
+        final_srt = unique_path(target_dir, safe_title, ".srt")
+        final_txt = unique_path(target_dir, safe_title, ".txt")
+        with open(final_srt, "w", encoding="utf-8") as f:
+            f.write(srt_text)
+        with open(final_txt, "w", encoding="utf-8") as f:
+            f.write(txt_text)
+
+        job["transcript_srt"] = final_srt
+        job["transcript_txt"] = final_txt
+        job["transcript_status"] = "done"
+        job["file"] = final_txt
+        job["filename"] = os.path.basename(final_txt)
+        job["status"] = "done"
+    except subprocess.CalledProcessError as e:
+        err = (e.stderr or "").strip().split("\n")[-1] or str(e)
+        job["status"] = "error"
+        job["transcript_status"] = "error"
+        job["error"] = err
+        job["transcript_error"] = err
+    except Exception as e:
+        job["status"] = "error"
+        job["transcript_status"] = "error"
+        job["error"] = str(e)
+        job["transcript_error"] = str(e)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def generate_transcript(job, url, video_path, library_dir, safe_title):
     """Best-effort: caption fetch first, then Whisper. Never raises — failures are
     recorded on the job so the video download itself is unaffected."""
@@ -166,6 +235,8 @@ def generate_transcript(job, url, video_path, library_dir, safe_title):
             with open(final_txt, "w", encoding="utf-8") as f:
                 f.write(txt_text)
 
+        job["transcript_srt"] = final_srt
+        job["transcript_txt"] = final_txt
         job["transcript_status"] = "done"
     except Exception as e:
         job["transcript_status"] = "error"
@@ -328,8 +399,9 @@ def start_download():
     format_id = data.get("format_id")
     title = data.get("title", "")
     dest = "server" if data.get("dest") == "server" else "browser"
-    # Transcripts only make sense for files landing in the library.
-    transcript = bool(data.get("transcript")) and dest == "server"
+    transcript_only = format_choice == "transcript"
+    # Sidecar transcripts (alongside a video) only make sense for files landing in the library.
+    transcript = bool(data.get("transcript")) and dest == "server" and not transcript_only
 
     if not url:
         return jsonify({"error": "No URL provided"}), 400
@@ -338,10 +410,13 @@ def start_download():
     jobs[job_id] = {
         "job_id": job_id, "status": "downloading", "url": url, "title": title,
         "dest": dest, "transcript": transcript,
-        "transcript_status": "pending" if transcript else None,
+        "transcript_status": "pending" if (transcript or transcript_only) else None,
     }
 
-    thread = threading.Thread(target=run_download, args=(job_id, url, format_choice, format_id))
+    if transcript_only:
+        thread = threading.Thread(target=run_transcript_only, args=(job_id, url))
+    else:
+        thread = threading.Thread(target=run_download, args=(job_id, url, format_choice, format_id))
     thread.daemon = True
     thread.start()
 
@@ -369,6 +444,19 @@ def download_file(job_id):
     if not job or job["status"] != "done" or job.get("dest") == "server":
         return jsonify({"error": "File not ready"}), 404
     return send_file(job["file"], as_attachment=True, download_name=job["filename"])
+
+
+@app.route("/api/transcript/<job_id>")
+def get_transcript(job_id):
+    job = jobs.get(job_id)
+    if not job or job.get("transcript_status") != "done":
+        return jsonify({"error": "Transcript not ready"}), 404
+    path = job.get("transcript_txt")
+    if not path or not os.path.exists(path):
+        return jsonify({"error": "Transcript file is missing"}), 404
+    with open(path, encoding="utf-8", errors="ignore") as f:
+        text = f.read()
+    return jsonify({"text": text, "filename": os.path.basename(path)})
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>DownLoader</title>
+  <title>Down↓oader</title>
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -417,6 +417,91 @@
       cursor: pointer;
     }
     .card-status.transcript { display: block; margin-top: 2px; }
+    .transcript-view-btn {
+      background: none;
+      border: none;
+      padding: 0;
+      font-family: inherit;
+      font-size: 0.8rem;
+      font-weight: 500;
+      color: var(--primary);
+      text-decoration: underline;
+      text-underline-offset: 2px;
+      cursor: pointer;
+    }
+    .transcript-view-btn:hover { color: var(--primary-hover); }
+
+    /* Transcript modal */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.5);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      z-index: 100;
+    }
+    .modal-overlay.hidden { display: none; }
+    .modal-box {
+      width: 100%;
+      max-width: 560px;
+      max-height: 80vh;
+      background: var(--card);
+      color: var(--card-foreground);
+      border: 1px solid var(--border);
+      border-radius: calc(var(--radius) + 4px);
+      box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .modal-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+    }
+    .modal-header h2 {
+      font-size: 0.95rem;
+      font-weight: 600;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .modal-close {
+      background: none;
+      border: none;
+      color: var(--muted-foreground);
+      cursor: pointer;
+      padding: 4px;
+      line-height: 0;
+      border-radius: 6px;
+    }
+    .modal-close:hover { background: var(--secondary); color: var(--foreground); }
+    .modal-body { padding: 16px 20px; overflow: hidden; display: flex; flex: 1; }
+    #transcriptText {
+      width: 100%;
+      flex: 1;
+      min-height: 220px;
+      resize: vertical;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 12px 14px;
+      background: var(--background);
+      color: var(--foreground);
+      font-family: 'Geist Mono', ui-monospace, monospace;
+      font-size: 0.82rem;
+      line-height: 1.5;
+    }
+    .modal-footer {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      padding: 12px 20px 16px;
+    }
 
     .footer {
       margin-top: 48px;
@@ -445,7 +530,7 @@
 <body>
   <div class="page">
     <div class="brand">
-      <h1>DownLoader</h1>
+      <h1>Down<span style="text-decoration: underline; text-underline-offset: 3px;">↓</span>oader</h1>
       <p>Powered by ReClip</p>
     </div>
 
@@ -456,13 +541,18 @@
       <div class="pill-group">
         <button class="pill active" data-format="video" onclick="setFormat(this)">MP4</button>
         <button class="pill" data-format="audio" onclick="setFormat(this)">MP3</button>
+        <button class="pill" data-format="transcript" onclick="setFormat(this)">Transcript only</button>
       </div>
       <button class="fetch-btn" id="goBtn" onclick="go()">Fetch</button>
     </div>
-    <label class="transcript-toggle">
+    <label class="transcript-toggle" id="wantTranscriptRow">
       <input type="checkbox" id="wantTranscript">
       With transcript (.srt + .txt, saved to server only)
     </label>
+    <p class="hint" id="transcriptOnlyHint" style="display:none">
+      Fetches captions if the source has them, otherwise transcribes audio locally with Whisper —
+      no video or audio file is ever saved to disk.
+    </p>
 
     <div id="cards" class="cards"></div>
 
@@ -470,6 +560,24 @@
       YouTube &middot; TikTok &middot; Instagram &middot; Twitter/X &middot; Reddit &middot; Facebook<br>
       Vimeo &middot; Twitch &middot; Dailymotion &middot; SoundCloud &middot; Loom &middot; Streamable<br>
       Pinterest &middot; Tumblr &middot; Threads &middot; LinkedIn &middot; 1000+ more
+    </div>
+  </div>
+
+  <div id="transcriptModal" class="modal-overlay hidden" onclick="if (event.target === this) closeTranscript()">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h2 id="transcriptTitle">Transcript</h2>
+        <button class="modal-close" onclick="closeTranscript()" aria-label="Close">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <textarea id="transcriptText" readonly></textarea>
+      </div>
+      <div class="modal-footer">
+        <span class="card-status" id="copyStatus"></span>
+        <button class="card-dl-btn server" onclick="copyTranscript()">Copy to clipboard</button>
+      </div>
     </div>
   </div>
 
@@ -481,6 +589,9 @@
       document.querySelectorAll('.pill').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       currentFormat = btn.dataset.format;
+      const isTranscriptOnly = currentFormat === 'transcript';
+      document.getElementById('wantTranscriptRow').style.display = isTranscriptOnly ? 'none' : '';
+      document.getElementById('transcriptOnlyHint').style.display = isTranscriptOnly ? '' : 'none';
     }
 
     function parseUrls(text) {
@@ -500,6 +611,55 @@
       return d.innerHTML;
     }
 
+    function escJs(s) {
+      return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    }
+
+    async function openTranscript(jobId, title) {
+      const modal = document.getElementById('transcriptModal');
+      const textEl = document.getElementById('transcriptText');
+      document.getElementById('transcriptTitle').textContent = title || 'Transcript';
+      document.getElementById('copyStatus').textContent = '';
+      textEl.value = 'Loading...';
+      modal.classList.remove('hidden');
+      try {
+        const res = await fetch(`/api/transcript/${jobId}`);
+        const data = await res.json();
+        textEl.value = data.error ? `(${data.error})` : data.text;
+      } catch (err) {
+        textEl.value = `(Could not load transcript: ${err.message})`;
+      }
+    }
+
+    function closeTranscript() {
+      document.getElementById('transcriptModal').classList.add('hidden');
+    }
+
+    async function copyTranscript() {
+      const textEl = document.getElementById('transcriptText');
+      const status = document.getElementById('copyStatus');
+      try {
+        await navigator.clipboard.writeText(textEl.value);
+        status.textContent = 'Copied!';
+      } catch (err) {
+        // Clipboard API needs a secure context (https or localhost); fall back
+        // to the older select+execCommand approach for plain-http LAN access.
+        try {
+          textEl.focus();
+          textEl.select();
+          document.execCommand('copy');
+          status.textContent = 'Copied!';
+        } catch (err2) {
+          status.textContent = 'Copy failed — select the text manually';
+        }
+      }
+      setTimeout(() => { status.textContent = ''; }, 2000);
+    }
+
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape') closeTranscript();
+    });
+
     function transcriptStatusHtml(c) {
       if (!c.transcriptStatus) return '';
       if (c.transcriptStatus === 'pending' || c.transcriptStatus === 'running') {
@@ -507,7 +667,8 @@
       }
       if (c.transcriptStatus === 'done') {
         const via = c.transcriptSource === 'whisper' ? 'Whisper' : 'captions';
-        return `<span class="card-status transcript done">Transcript saved (${via})</span>`;
+        return `<span class="card-status transcript done">Transcript saved (${via}) &middot;
+          <button class="transcript-view-btn" onclick="openTranscript('${c.jobId}', '${escJs(c.title || 'Transcript')}')">View</button></span>`;
       }
       return `<span class="card-status transcript error">Transcript failed: ${esc(friendlyError(c.transcriptError || ''))}</span>`;
     }
@@ -641,9 +802,15 @@
       // Ready / downloading / done / error states
       el.className = 'card';
       const isAudio = currentFormat === 'audio';
+      const isTranscriptOnly = currentFormat === 'transcript';
+      // Locks in what this specific job actually is, so wording stays correct
+      // even if the pill selection changes while the job is in flight.
+      const jobIsTranscriptOnly = c.jobFormat ? c.jobFormat === 'transcript' : isTranscriptOnly;
 
       let thumbHtml;
-      if (isAudio) {
+      if (isTranscriptOnly) {
+        thumbHtml = `<div class="no-thumb" style="color:var(--primary)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="16" y2="17"/></svg></div>`;
+      } else if (isAudio) {
         thumbHtml = `<div class="no-thumb" style="color:var(--accent)"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="5 3 19 12 5 21 5 3"/></svg></div>`;
       } else if (c.thumbnail) {
         thumbHtml = `<img src="${c.thumbnail}" alt="">`;
@@ -652,7 +819,7 @@
       }
 
       let qualityChips = '';
-      if (!isAudio && c.formats && c.formats.length > 1) {
+      if (!isAudio && !isTranscriptOnly && c.formats && c.formats.length > 1) {
         qualityChips = c.formats.map(f =>
           `<button class="q-chip${f.id === c.selectedFormatId ? ' active' : ''}" onclick="pickFormat(${idx}, '${f.id}')">${f.label}</button>`
         ).join('');
@@ -660,10 +827,17 @@
 
       let actionHtml = '';
       if (c.status === 'ready') {
-        actionHtml = `<button class="card-dl-btn" onclick="dlCard(${idx}, 'browser')">Download</button>
+        const dlLabel = isTranscriptOnly ? 'Get transcript' : 'Download';
+        actionHtml = `<button class="card-dl-btn" onclick="dlCard(${idx}, 'browser')">${dlLabel}</button>
           <button class="card-dl-btn server" onclick="dlCard(${idx}, 'server')">Save to server</button>${qualityChips}`;
       } else if (c.status === 'downloading') {
-        actionHtml = `<span class="card-status downloading"><span class="spin"></span> Downloading...</span>`;
+        const label = jobIsTranscriptOnly ? 'Generating transcript...' : 'Downloading...';
+        actionHtml = `<span class="card-status downloading"><span class="spin"></span> ${label}</span>`;
+      } else if (c.status === 'done' && jobIsTranscriptOnly) {
+        const savedLabel = c.dest === 'server'
+          ? `Transcript saved to server (.srt + .txt)`
+          : `<button class="card-dl-btn done" onclick="saveCard(${idx})">Save .txt</button> ${esc(c.filename || '')}`;
+        actionHtml = `<span class="card-status done">${savedLabel}</span>${transcriptStatusHtml(c)}`;
       } else if (c.status === 'done' && c.dest === 'server') {
         actionHtml = `<span class="card-status done">Saved to server: ${esc(c.filename || '')}</span>
           ${transcriptStatusHtml(c)}`;
@@ -705,6 +879,7 @@
     async function dlCard(idx, dest = 'browser') {
       const c = cardData[idx];
       c.dest = dest;
+      c.jobFormat = currentFormat;
       c.status = 'downloading';
       c.error = null;
       renderCard(idx);
