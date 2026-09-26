@@ -401,6 +401,23 @@
     }
     @keyframes spin { to { transform: rotate(360deg); } }
 
+    .transcript-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.8rem;
+      color: var(--muted-foreground);
+      cursor: pointer;
+      user-select: none;
+    }
+    .transcript-toggle input {
+      width: 15px;
+      height: 15px;
+      accent-color: var(--primary);
+      cursor: pointer;
+    }
+    .card-status.transcript { display: block; margin-top: 2px; }
+
     .footer {
       margin-top: 48px;
       text-align: center;
@@ -442,6 +459,10 @@
       </div>
       <button class="fetch-btn" id="goBtn" onclick="go()">Fetch</button>
     </div>
+    <label class="transcript-toggle">
+      <input type="checkbox" id="wantTranscript">
+      With transcript (.srt + .txt, saved to server only)
+    </label>
 
     <div id="cards" class="cards"></div>
 
@@ -477,6 +498,18 @@
       const d = document.createElement('div');
       d.textContent = s;
       return d.innerHTML;
+    }
+
+    function transcriptStatusHtml(c) {
+      if (!c.transcriptStatus) return '';
+      if (c.transcriptStatus === 'pending' || c.transcriptStatus === 'running') {
+        return `<span class="card-status transcript downloading"><span class="spin"></span> Transcribing...</span>`;
+      }
+      if (c.transcriptStatus === 'done') {
+        const via = c.transcriptSource === 'whisper' ? 'Whisper' : 'captions';
+        return `<span class="card-status transcript done">Transcript saved (${via})</span>`;
+      }
+      return `<span class="card-status transcript error">Transcript failed: ${esc(friendlyError(c.transcriptError || ''))}</span>`;
     }
 
     function friendlyError(err) {
@@ -632,7 +665,8 @@
       } else if (c.status === 'downloading') {
         actionHtml = `<span class="card-status downloading"><span class="spin"></span> Downloading...</span>`;
       } else if (c.status === 'done' && c.dest === 'server') {
-        actionHtml = `<span class="card-status done">Saved to server: ${esc(c.filename || '')}</span>`;
+        actionHtml = `<span class="card-status done">Saved to server: ${esc(c.filename || '')}</span>
+          ${transcriptStatusHtml(c)}`;
       } else if (c.status === 'done') {
         actionHtml = `<button class="card-dl-btn done" onclick="saveCard(${idx})">Save</button>
           <span class="card-status done">${esc(c.filename || '')}</span>`;
@@ -685,6 +719,7 @@
             format_id: c.selectedFormatId,
             title: c.title || '',
             dest,
+            transcript: dest === 'server' && document.getElementById('wantTranscript').checked,
           }),
         });
         const data = await res.json();
@@ -705,21 +740,31 @@
 
     function pollCard(idx) {
       const c = cardData[idx];
+      let savedOnce = false;
       const iv = setInterval(async () => {
         try {
           const res = await fetch(`/api/status/${c.jobId}`);
           const data = await res.json();
-          if (data.status === 'done') {
-            clearInterval(iv);
-            c.status = 'done';
-            c.filename = data.filename;
-            renderCard(idx);
-            if (c.dest !== 'server') saveCard(idx);
-          } else if (data.status === 'error') {
+          c.transcriptStatus = data.transcript_status;
+          c.transcriptError = data.transcript_error;
+          c.transcriptSource = data.transcript_source;
+
+          if (data.status === 'error') {
             clearInterval(iv);
             c.status = 'error';
             c.error = data.error;
             renderCard(idx);
+            return;
+          }
+          if (data.status === 'done') {
+            c.status = 'done';
+            c.filename = data.filename;
+            if (c.dest !== 'server' && !savedOnce) { savedOnce = true; saveCard(idx); }
+            renderCard(idx);
+            // Once the video is done, only keep polling if a transcript is still in progress.
+            if (data.transcript_status !== 'pending' && data.transcript_status !== 'running') {
+              clearInterval(iv);
+            }
           }
         } catch {
           clearInterval(iv);

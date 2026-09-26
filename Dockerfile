@@ -19,7 +19,9 @@ COPY . .
 
 RUN useradd -m -u 1000 reclip && \
     mkdir -p /app/downloads /app/library && \
-    chown -R reclip:reclip /app
+    chown -R reclip:reclip /app && \
+    mkdir -p /home/reclip/.cache && \
+    chown -R reclip:reclip /home/reclip/.cache
 USER reclip
 
 # Put the reclip user's --user installs first so startup yt-dlp updates take effect.

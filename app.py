@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 from flask import Flask, request, jsonify, send_file, render_template
 
@@ -14,10 +15,38 @@ DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "downloads")
 # Library dir: target of "save to server" jobs (bind-mounted to the Jellyfin videos folder).
 LIBRARY_DIR = os.environ.get("LIBRARY_DIR", os.path.join(os.path.dirname(__file__), "library"))
 DOWNLOAD_TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT", 1800))
+TRANSCRIBE_TIMEOUT = int(os.environ.get("TRANSCRIBE_TIMEOUT", 3600))
+# Falls back to plain yt-dlp (and occasional 429s on captions) if not set.
+POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "")
+WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL", "small")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(LIBRARY_DIR, exist_ok=True)
 
 jobs = {}
+_whisper_model = None  # lazy-loaded singleton so app startup doesn't pay for it
+
+
+def ytdlp_extra_args():
+    """Extra yt-dlp flags shared by every invocation (currently just the PO token sidecar)."""
+    if not POT_PROVIDER_URL:
+        return []
+    return ["--extractor-args", f"youtubepot-bgutilhttp:base_url={POT_PROVIDER_URL}"]
+
+
+def get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+        _whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
+    return _whisper_model
+
+
+def srt_timestamp(seconds):
+    ms = round(seconds * 1000)
+    h, ms = divmod(ms, 3600000)
+    m, ms = divmod(ms, 60000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
 def safe_filename(title, fallback):
@@ -53,11 +82,101 @@ def parse_ytdlp_json(stdout):
     raise ValueError("yt-dlp returned no data")
 
 
+def fetch_captions(url, tmp_dir, job_id):
+    """Try to fetch existing captions (creator-uploaded or YouTube auto-generated) as SRT.
+
+    Returns the .srt path on success, or None if the source has no captions at all
+    (which is a normal outcome, not an error).
+    """
+    out_template = os.path.join(tmp_dir, f"{job_id}.%(ext)s")
+    cmd = (
+        ["yt-dlp", "--no-playlist", "--skip-download",
+         "--write-subs", "--write-auto-subs", "--sub-langs", "en",
+         "--convert-subs", "srt", "-o", out_template]
+        + ytdlp_extra_args() + [url]
+    )
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return None
+
+    srts = sorted(glob.glob(os.path.join(tmp_dir, f"{job_id}.*.srt")))
+    if not srts:
+        return None
+    # Prefer a manually-uploaded track (yt-dlp suffixes auto ones the same way,
+    # so this is a best-effort pick, not a guarantee) and clean up the rest.
+    chosen = srts[0]
+    for f in srts[1:]:
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+    return chosen
+
+
+def transcribe_with_whisper(video_path, tmp_dir, job_id):
+    """Fall back to local speech-to-text when the source has no captions.
+
+    Extracts audio with ffmpeg, runs it through faster-whisper, and returns
+    (srt_text, txt_text).
+    """
+    audio_path = os.path.join(tmp_dir, f"{job_id}.wav")
+    ffmpeg_cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-ac", "1", "-ar", "16000", audio_path]
+    subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=TRANSCRIBE_TIMEOUT, check=True)
+
+    model = get_whisper_model()
+    segments, _info = model.transcribe(audio_path, beam_size=5)
+
+    srt_lines = []
+    txt_lines = []
+    for i, seg in enumerate(segments, start=1):
+        text = seg.text.strip()
+        txt_lines.append(text)
+        srt_lines.append(str(i))
+        srt_lines.append(f"{srt_timestamp(seg.start)} --> {srt_timestamp(seg.end)}")
+        srt_lines.append(text)
+        srt_lines.append("")
+
+    return "\n".join(srt_lines), " ".join(txt_lines)
+
+
+def generate_transcript(job, url, video_path, library_dir, safe_title):
+    """Best-effort: caption fetch first, then Whisper. Never raises — failures are
+    recorded on the job so the video download itself is unaffected."""
+    job["transcript_status"] = "running"
+    try:
+        with tempfile.TemporaryDirectory(dir=DOWNLOAD_DIR) as tmp_dir:
+            job_id = job["job_id"]
+            srt_path = fetch_captions(url, tmp_dir, job_id)
+            if srt_path:
+                srt_text = open(srt_path, encoding="utf-8", errors="ignore").read()
+                txt_text = " ".join(
+                    line.strip() for line in srt_text.splitlines()
+                    if line.strip() and "-->" not in line and not line.strip().isdigit()
+                )
+                job["transcript_source"] = "captions"
+            else:
+                srt_text, txt_text = transcribe_with_whisper(video_path, tmp_dir, job_id)
+                job["transcript_source"] = "whisper"
+
+            final_srt = unique_path(library_dir, safe_title, ".srt")
+            final_txt = unique_path(library_dir, safe_title, ".txt")
+            with open(final_srt, "w", encoding="utf-8") as f:
+                f.write(srt_text)
+            with open(final_txt, "w", encoding="utf-8") as f:
+                f.write(txt_text)
+
+        job["transcript_status"] = "done"
+    except Exception as e:
+        job["transcript_status"] = "error"
+        job["transcript_error"] = str(e)
+
+
 def run_download(job_id, url, format_choice, format_id):
     job = jobs[job_id]
     out_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
 
-    cmd = ["yt-dlp", "--no-playlist", "-o", out_template]
+    cmd = ["yt-dlp", "--no-playlist", "-o", out_template] + ytdlp_extra_args()
 
     if format_choice == "audio":
         cmd += ["-x", "--audio-format", "mp3"]
@@ -104,10 +223,16 @@ def run_download(job_id, url, format_choice, format_id):
             shutil.move(chosen, final)
             job["file"] = final
             job["filename"] = os.path.basename(final)
+            job["status"] = "done"
+            if job.get("transcript"):
+                # Runs synchronously in this same background thread — the job stays
+                # "downloading" in the UI's eyes only via transcript_status, video is
+                # already marked done above so "Saved to server" shows immediately.
+                generate_transcript(job, url, final, LIBRARY_DIR, safe_title)
         else:
             job["file"] = chosen
             job["filename"] = f"{safe_title}{ext}"
-        job["status"] = "done"
+            job["status"] = "done"
     except subprocess.TimeoutExpired:
         job["status"] = "error"
         job["error"] = f"Download timed out ({DOWNLOAD_TIMEOUT // 60} min limit)"
@@ -133,7 +258,7 @@ def get_info():
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
-    cmd = ["yt-dlp", "--no-playlist", "-j", url]
+    cmd = ["yt-dlp", "--no-playlist", "-j"] + ytdlp_extra_args() + [url]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if result.returncode != 0:
@@ -179,7 +304,7 @@ def get_playlist_info():
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
-    cmd = ["yt-dlp", "--flat-playlist", "-J", url]
+    cmd = ["yt-dlp", "--flat-playlist", "-J"] + ytdlp_extra_args() + [url]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if result.returncode != 0:
@@ -203,12 +328,18 @@ def start_download():
     format_id = data.get("format_id")
     title = data.get("title", "")
     dest = "server" if data.get("dest") == "server" else "browser"
+    # Transcripts only make sense for files landing in the library.
+    transcript = bool(data.get("transcript")) and dest == "server"
 
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
     job_id = uuid.uuid4().hex[:10]
-    jobs[job_id] = {"status": "downloading", "url": url, "title": title, "dest": dest}
+    jobs[job_id] = {
+        "job_id": job_id, "status": "downloading", "url": url, "title": title,
+        "dest": dest, "transcript": transcript,
+        "transcript_status": "pending" if transcript else None,
+    }
 
     thread = threading.Thread(target=run_download, args=(job_id, url, format_choice, format_id))
     thread.daemon = True
@@ -226,6 +357,9 @@ def check_status(job_id):
         "status": job["status"],
         "error": job.get("error"),
         "filename": job.get("filename"),
+        "transcript_status": job.get("transcript_status"),
+        "transcript_error": job.get("transcript_error"),
+        "transcript_source": job.get("transcript_source"),
     })
 
 
